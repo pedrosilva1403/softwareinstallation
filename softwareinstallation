@@ -1,0 +1,652 @@
+#requires -version 5.1
+<#
+  Fluxo:
+    1) Pede HOSTNAME
+    2) Pede CREDENCIAIS (para \\hostname\d$ e WMI/DCOM)
+    3) Menu principal:
+       1 - Instalação de Programas
+           1 - Rad Console -> copia p/ D:\Instaladores, instala /qn, limpa conteúdo
+           2 - Microsoft
+               1 - Office 2016
+               2 - Office 365
+               3 - Power BI (Desktop)
+               4 - Project 2010
+               5 - Voltar
+           3 - Sair
+       2 - Desinstalação de Programas
+           1 - Rad Console -> busca no registro remoto (HKLM 64/32) e desinstala silencioso
+           2 - Sair
+       0 - Sair
+  LOG: .\Logs\Gerenciador_Remoto_<timestamp>.log (Start-Transcript)
+#>
+
+$ErrorActionPreference = 'Stop'
+
+# --- Auto-elevação (reabre como Admin se necessário) ---
+if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Start-Process -FilePath "powershell.exe" `
+        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" `
+        -Verb RunAs
+    exit
+}
+
+# ===== Configuração =====
+$RadConsole = [pscustomobject]@{
+    NomePrograma = 'Rad Console'
+    # CONTEÚDO desta pasta será copiado para D:\Instaladores
+    Origem       = '\\brlav1fls1\helpdesk$\Programas\Producao\RADs Instaladores\Desktops\RAD Console\Setup'
+    MsiNome      = 'Setup1.msi'     # arquivo que será instalado após a cópia
+    DisplayName  = 'RAD console'    # nome no painel de controle para DESINSTALAR (case-insensitive)
+}
+
+# ===== Definições: Microsoft =====
+$Msft = [pscustomobject]@{
+    Office2016  = [pscustomobject]@{
+        NomePrograma = 'Office 2016'
+        Origem       = '\\brlav1fls1\helpdesk$\Programas\ICT\Office2016\SW_DVD5_Office_Professional_Plus_2016_W32_English_MLF_X20-41353'
+        ExeNome      = 'setup.exe'
+        DisplayName  = 'Microsoft Office Professional Plus 2016'   # ajuste se necessário para desinstalação futura
+        Subpasta     = 'Microsoft\Office2016'
+    }
+    Office365   = [pscustomobject]@{
+        NomePrograma = 'Office 365'
+        Origem       = '\\brlav1fls1\helpdesk$\Programas\ICT\Office 365\Instalador Online 08-08-2025'
+        ExeNome      = 'OfficeSetup.exe'
+        DisplayName  = 'Microsoft 365 Apps for enterprise'         # ajuste se necessário
+        Subpasta     = 'Microsoft\Office365'
+    }
+    PowerBI     = [pscustomobject]@{
+        NomePrograma = 'Power BI (Desktop)'
+        Origem       = '\\brlav1fls1\helpdesk$\Programas\ICT\PowerBI Desktop'
+        ExeNome      = 'PBIDesktopSetup_x64.exe'
+        DisplayName  = 'Microsoft Power BI Desktop'
+        Subpasta     = 'Microsoft\PowerBI'
+    }
+    Project2010 = [pscustomobject]@{
+        NomePrograma = 'Project 2010'
+        Origem       = '\\brlav1fls1\helpdesk$\Programas\ICT\Project 2010'
+        ExeNome      = 'setup.exe'
+        DisplayName  = 'Microsoft Project Professional 2010'        # ajuste se necessário
+        Subpasta     = 'Microsoft\Project2010'
+    }
+}
+
+# ===== Pasta e arquivo de LOG =====
+$Global:LogRoot = Join-Path -Path (Split-Path -Parent $PSCommandPath) -ChildPath 'Logs'
+if (-not (Test-Path -LiteralPath $Global:LogRoot)) {
+    New-Item -Path $Global:LogRoot -ItemType Directory -Force | Out-Null
+}
+$Global:LogPath = Join-Path $Global:LogRoot ("Gerenciador_Remoto_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+Start-Transcript -Path $Global:LogPath -Force | Out-Null
+
+# ===== Utilidades =====
+function Read-YesNo([string]$Pergunta) {
+    while ($true) {
+        $resp = Read-Host "$Pergunta (S/N)"
+        if ($resp -match '^[sS]') { return $true }
+        if ($resp -match '^[nN]') { return $false }
+        Write-Host "Digite S ou N." -ForegroundColor Yellow
+    }
+}
+function Convert-SecureStringToPlainText {
+    param([Parameter(Mandatory)] [securestring] $Secure)
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+    try   { return [Runtime.InteropServices.Marshal]::PtrToStringUni($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+function Log-Exception {
+    param([Parameter(Mandatory)] $Ex)
+    Write-Host "⛔ Detalhes da exceção:" -ForegroundColor Red
+    $txt = ($Ex | Format-List * -Force | Out-String)
+    Write-Host $txt -ForegroundColor DarkGray
+}
+function Connect-AdminShare {
+    param(
+        [Parameter(Mandatory)] [string] $Hostname,
+        [Parameter(Mandatory)] [pscredential] $Credential
+    )
+    try {
+        cmd /c "net use \\$Hostname\ipc$ /delete /y >nul 2>&1"
+        cmd /c "net use \\$Hostname\d$   /delete /y >nul 2>&1"
+        $user = $Credential.UserName
+        $pass = Convert-SecureStringToPlainText $Credential.Password
+        $cmd = "net use \\$Hostname\d$ /user:$user `"$pass`""
+        Write-Host "🔐 Conectando a \\$Hostname\d$ com o usuário: $user" -ForegroundColor Cyan
+        cmd /c $cmd | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Falha ao autenticar em \\$Hostname\d$ (código $LASTEXITCODE)." -ForegroundColor Red
+            return $false
+        }
+        return $true
+    } catch {
+        Log-Exception -Ex $_
+        return $false
+    }
+}
+function Disconnect-AdminShare {
+    param([Parameter(Mandatory)] [string] $Hostname)
+    try {
+        cmd /c "net use \\$Hostname\d$ /delete /y >nul 2>&1"
+        cmd /c "net use \\$Hostname\ipc$ /delete /y >nul 2>&1"
+        Write-Host "🔌 Conexão SMB com \\$Hostname liberada." -ForegroundColor DarkGray
+    } catch {
+        Log-Exception -Ex $_
+    }
+}
+function Start-RemoteProcess {
+    param(
+        [Parameter(Mandatory)] [string] $Hostname,
+        [Parameter(Mandatory)] [pscredential] $Credential,
+        [Parameter(Mandatory)] [string] $CommandLine,
+        [string] $WorkingDirectory = 'C:\Windows\System32'
+    )
+    Write-Host "🚀 Comando remoto: $CommandLine" -ForegroundColor DarkGray
+    $opt = New-CimSessionOption -Protocol Dcom
+    $cim = $null
+    try {
+        $cim = New-CimSession -ComputerName $Hostname -Credential $Credential -SessionOption $opt
+        $args = @{ CommandLine = $CommandLine; CurrentDirectory = $WorkingDirectory }
+        $res = Invoke-CimMethod -CimSession $cim -ClassName Win32_Process -MethodName Create -Arguments $args
+        Write-Host "Win32_Process.Create -> ReturnValue=$($res.ReturnValue); PID=$($res.ProcessId)" -ForegroundColor DarkGray
+        [pscustomobject]@{ ReturnValue = $res.ReturnValue; ProcessId = $res.ProcessId }
+    }
+    finally { if ($cim) { $cim | Remove-CimSession } }
+}
+function Wait-RemoteProcessByProcessId {
+    param(
+        [Parameter(Mandatory)] [string] $Hostname,
+        [Parameter(Mandatory)] [pscredential] $Credential,
+        [Parameter(Mandatory)] [int] $ProcessId,
+        [int] $TimeoutSeconds = 900
+    )
+    $opt = New-CimSessionOption -Protocol Dcom
+    $cim = $null
+    try {
+        $cim = New-CimSession -ComputerName $Hostname -Credential $Credential -SessionOption $opt
+        $elapsed = 0; $interval = 3
+        while ($elapsed -lt $TimeoutSeconds) {
+            $p = Get-CimInstance -CimSession $cim -ClassName Win32_Process -Filter "ProcessId=$ProcessId"
+            if (-not $p) { return $true }
+            Start-Sleep -Seconds $interval; $elapsed += $interval
+        }
+        return $false
+    }
+    finally { if ($cim) { $cim | Remove-CimSession } }
+}
+function Find-RemoteUninstallEntries {
+    param(
+        [Parameter(Mandatory)] [string] $Hostname,
+        [Parameter(Mandatory)] [pscredential] $Credential,
+        [Parameter(Mandatory)] [string] $DisplayName
+    )
+    $HKLM  = [uint32]2147483650
+    $roots = @(
+        [string]'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        [string]'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    $opt = New-CimSessionOption -Protocol Dcom
+    $cim = $null
+    $results = @()
+    try {
+        $cim = New-CimSession -ComputerName $Hostname -Credential $Credential -SessionOption $opt
+        foreach ($root in $roots) {
+            $enum = Invoke-CimMethod -CimSession $cim -Namespace 'root\default' -ClassName 'StdRegProv' -MethodName 'EnumKey' -Arguments @{
+                hDefKey     = $HKLM
+                sSubKeyName = [string]$root
+            } -ErrorAction Stop
+            $subkeys = @()
+            if ($null -ne $enum.sNames) {
+                if ($enum.sNames -is [string]) { $subkeys = @($enum.sNames) }
+                elseif ($enum.sNames -is [System.Array]) { $subkeys = $enum.sNames }
+            }
+            foreach ($sub in $subkeys) {
+                $keyPath = "$root\$sub"
+                $dn = Invoke-CimMethod -CimSession $cim -Namespace 'root\default' -ClassName 'StdRegProv' -MethodName 'GetStringValue' -Arguments @{
+                    hDefKey     = $HKLM
+                    sSubKeyName = [string]$keyPath
+                    sValueName  = [string]'DisplayName'
+                } -ErrorAction SilentlyContinue
+                $disp = $dn.sValue
+                if ([string]::IsNullOrWhiteSpace($disp)) { continue }
+                $tgt = $DisplayName.Trim().ToLower()
+                $cur = $disp.Trim().ToLower()
+                $match = ($cur -eq $tgt) -or ($cur.StartsWith($tgt)) -or ($cur.Contains($tgt))
+                if (-not $match) { continue }
+                $uninst = (Invoke-CimMethod -CimSession $cim -Namespace 'root\default' -ClassName 'StdRegProv' -MethodName 'GetStringValue' -Arguments @{
+                    hDefKey     = $HKLM
+                    sSubKeyName = [string]$keyPath
+                    sValueName  = [string]'UninstallString'
+                } -ErrorAction SilentlyContinue).sValue
+                $quietUninst = (Invoke-CimMethod -CimSession $cim -Namespace 'root\default' -ClassName 'StdRegProv' -MethodName 'GetStringValue' -Arguments @{
+                    hDefKey     = $HKLM
+                    sSubKeyName = [string]$keyPath
+                    sValueName  = [string]'QuietUninstallString'
+                } -ErrorAction SilentlyContinue).sValue
+                $guid = $null
+                foreach ($s in @($uninst, $quietUninst)) {
+                    if ($s) {
+                        $m = [regex]::Match($s, '\{[0-9A-Fa-f\-]{36}\}')
+                        if ($m.Success) { $guid = $m.Value; break }
+                    }
+                }
+                $results += [pscustomobject]@{
+                    DisplayName          = $disp
+                    UninstallString      = $uninst
+                    QuietUninstallString = $quietUninst
+                    Guid                 = $guid
+                    RegKey               = "HKLM:\$keyPath"
+                }
+            }
+        }
+        return $results
+    }
+    catch {
+        if (Get-Command Log-Exception -ErrorAction SilentlyContinue) { Log-Exception -Ex $_ }
+        return @()
+    }
+    finally { if ($cim) { $cim | Remove-CimSession } }
+}
+
+# ===== AÇÕES =====
+function Acao-Instalar-RadConsole {
+    param(
+        [Parameter(Mandatory)] [string] $Hostname,
+        [Parameter(Mandatory)] [pscredential] $Credential
+    )
+    try {
+        if (-not (Test-Path -LiteralPath $RadConsole.Origem)) {
+            Write-Host "A pasta de origem não existe ou está inacessível:" -ForegroundColor Red
+            Write-Host "  $($RadConsole.Origem)" -ForegroundColor Yellow
+            return
+        }
+        $instaladoresUNC = "\\$Hostname\d$\Instaladores"
+        $remoteMsiFull   = "D:\Instaladores\$($RadConsole.MsiNome)"
+        Write-Host ""
+        Write-Host "Origem:  $($RadConsole.Origem)"
+        Write-Host "Destino: $instaladoresUNC"
+        if (-not (Read-YesNo "Deseja continuar com a CÓPIA do CONTEÚDO para 'Instaladores' no destino?")) {
+            Write-Host "Cópia cancelada. Voltando ao menu..." -ForegroundColor Yellow
+            return
+        }
+        if (-not (Connect-AdminShare -Hostname $Hostname -Credential $Credential)) {
+            Write-Host "Não foi possível autenticar no destino." -ForegroundColor Red
+            return
+        }
+        try {
+            Write-Host "Garantindo a existência de $instaladoresUNC ..." -ForegroundColor Cyan
+            if (-not (Test-Path -LiteralPath $instaladoresUNC)) {
+                New-Item -Path $instaladoresUNC -ItemType Directory -Force | Out-Null
+            }
+            $srcContent = (Join-Path $RadConsole.Origem '*')
+            Write-Host "Copiando conteúdo para $instaladoresUNC ..." -ForegroundColor Cyan
+            Copy-Item -Path $srcContent -Destination $instaladoresUNC -Recurse -Force
+            Write-Host "Cópia concluída." -ForegroundColor Green
+            if (-not (Read-YesNo "Deseja instalar silenciosamente o $($RadConsole.MsiNome) agora?")) {
+                Write-Host "Instalação cancelada. Voltando ao menu..." -ForegroundColor Yellow
+                return
+            }
+            $msiUNC = Join-Path $instaladoresUNC $RadConsole.MsiNome
+            if (-not (Test-Path -LiteralPath $msiUNC)) {
+                Write-Host "MSI não encontrado no destino: $msiUNC" -ForegroundColor Red
+                return
+            }
+            Write-Host "Iniciando instalação silenciosa em $Hostname..." -ForegroundColor Cyan
+            $cmd = "msiexec.exe /i `"$remoteMsiFull`" /qn /norestart"
+            $start = Start-RemoteProcess -Hostname $Hostname -Credential $Credential -CommandLine $cmd
+            if ($start.ReturnValue -ne 0) {
+                Write-Host "Falha ao iniciar a instalação (WMI retornou $($start.ReturnValue))." -ForegroundColor Red
+            } else {
+                if ($start.ProcessId -and $start.ProcessId -gt 0) {
+                    $finished = Wait-RemoteProcessByProcessId -Hostname $Hostname -Credential $Credential -ProcessId $start.ProcessId -TimeoutSeconds 900
+                    if ($finished) {
+                        Write-Host "Instalação concluída (PID $($start.ProcessId))." -ForegroundColor Green
+                    } else {
+                        Write-Host "Tempo esgotado aguardando a instalação (PID $($start.ProcessId))." -ForegroundColor Yellow
+                    }
+                } else {
+                    Write-Host "Instalação disparada, mas o PID não foi retornado." -ForegroundColor Yellow
+                }
+            }
+            Write-Host "Limpando arquivos copiados em $instaladoresUNC ..." -ForegroundColor Cyan
+            try {
+                Get-ChildItem -Path $instaladoresUNC -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "Limpeza concluída." -ForegroundColor Green
+            } catch {
+                Log-Exception -Ex $_
+                Write-Host "Falha na limpeza (o processo continuará)." -ForegroundColor Yellow
+            }
+        } finally {
+            Disconnect-AdminShare -Hostname $Hostname
+        }
+    } catch {
+        Log-Exception -Ex $_
+        Write-Host "Erro durante a instalação." -ForegroundColor Red
+    }
+}
+
+function Invoke-RemoteInstallFromShare {
+    param(
+        [Parameter(Mandatory)] [string]        $Hostname,
+        [Parameter(Mandatory)] [pscredential]  $Credential,
+        [Parameter(Mandatory)] [string]        $ProgramName,
+        [Parameter(Mandatory)] [string]        $SourcePath,
+        [Parameter(Mandatory)] [string]        $RemoteSubfolder,
+        [Parameter(Mandatory)] [string]        $ExecutableName,
+        [Parameter()]              [scriptblock] $BuildArgsScript
+    )
+    try {
+        if (-not (Test-Path -LiteralPath $SourcePath)) {
+            Write-Host "A pasta de origem não existe ou está inacessível:" -ForegroundColor Red
+            Write-Host "  $SourcePath" -ForegroundColor Yellow
+            return
+        }
+        $remoteRootUNC   = "\\$Hostname\d$\Instaladores\$RemoteSubfolder"
+        $remoteRootLocal = "D:\Instaladores\$RemoteSubfolder"
+        $exeUNC          = Join-Path $remoteRootUNC   $ExecutableName
+        $exeLocal        = Join-Path $remoteRootLocal $ExecutableName
+        Write-Host ""
+        Write-Host "[$ProgramName] Origem:  $SourcePath"
+        Write-Host "[$ProgramName] Destino: $remoteRootUNC"
+        if (-not (Read-YesNo "Deseja continuar com a CÓPIA do CONTEÚDO para '$remoteRootUNC'?")) {
+            Write-Host "Cópia cancelada. Voltando..." -ForegroundColor Yellow
+            return
+        }
+        if (-not (Connect-AdminShare -Hostname $Hostname -Credential $Credential)) {
+            Write-Host "Não foi possível autenticar no destino." -ForegroundColor Red
+            return
+        }
+        try {
+            Write-Host "Garantindo a existência de $remoteRootUNC ..." -ForegroundColor Cyan
+            if (-not (Test-Path -LiteralPath $remoteRootUNC)) {
+                New-Item -Path $remoteRootUNC -ItemType Directory -Force | Out-Null
+            }
+            Write-Host "Copiando conteúdo para $remoteRootUNC ..." -ForegroundColor Cyan
+            Copy-Item -Path (Join-Path $SourcePath '*') -Destination $remoteRootUNC -Recurse -Force
+            Write-Host "Cópia concluída." -ForegroundColor Green
+            if (-not (Test-Path -LiteralPath $exeUNC)) {
+                Write-Host "Executável não encontrado no destino: $exeUNC" -ForegroundColor Red
+                return
+            }
+            $args = ''
+            if ($BuildArgsScript) {
+                $args = & $BuildArgsScript $remoteRootLocal $remoteRootUNC
+                if ($null -eq $args) { $args = '' }
+            }
+            Write-Host "[$ProgramName] Comando a executar no remoto:" -ForegroundColor DarkGray
+            Write-Host "  `"$exeLocal`" $args" -ForegroundColor DarkGray
+            if (-not (Read-YesNo "Deseja INSTALAR silenciosamente o '$ProgramName' agora?")) {
+                Write-Host "Instalação cancelada. Voltando..." -ForegroundColor Yellow
+                return
+            }
+            $cmd   = "`"$exeLocal`" $args"
+            $start = Start-RemoteProcess -Hostname $Hostname -Credential $Credential -CommandLine $cmd
+            if ($start.ReturnValue -ne 0) {
+                Write-Host "Falha ao iniciar a instalação (WMI retornou $($start.ReturnValue))." -ForegroundColor Red
+            } else {
+                if ($start.ProcessId -and $start.ProcessId -gt 0) {
+                    $finished = Wait-RemoteProcessByProcessId -Hostname $Hostname -Credential $Credential -ProcessId $start.ProcessId -TimeoutSeconds 3600
+                    if ($finished) {
+                        Write-Host "Instalação concluída (PID $($start.ProcessId))." -ForegroundColor Green
+                    } else {
+                        Write-Host "Tempo esgotado aguardando a instalação (PID $($start.ProcessId))." -ForegroundColor Yellow
+                    }
+                } else {
+                    Write-Host "Instalação disparada, mas o PID não foi retornado." -ForegroundColor Yellow
+                }
+            }
+            Write-Host "Limpando arquivos copiados em $remoteRootUNC ..." -ForegroundColor Cyan
+            try {
+                Remove-Item -LiteralPath $remoteRootUNC -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Host "Limpeza concluída." -ForegroundColor Green
+            } catch {
+                Log-Exception -Ex $_
+                Write-Host "Falha na limpeza (o processo continuará)." -ForegroundColor Yellow
+            }
+        } finally {
+            Disconnect-AdminShare -Hostname $Hostname
+        }
+    }
+    catch {
+        Log-Exception -Ex $_
+        Write-Host "Erro durante a instalação de '$ProgramName'." -ForegroundColor Red
+    }
+}
+
+function Acao-Instalar-Office2016 {
+    param([Parameter(Mandatory)] [string] $Hostname,[Parameter(Mandatory)] [pscredential] $Credential)
+    Invoke-RemoteInstallFromShare -Hostname $Hostname -Credential $Credential -ProgramName $Msft.Office2016.NomePrograma `
+        -SourcePath $Msft.Office2016.Origem -RemoteSubfolder $Msft.Office2016.Subpasta -ExecutableName $Msft.Office2016.ExeNome `
+        -BuildArgsScript {
+            param($RemoteRootLocal, $RemoteRootUNC)
+            $candidates = @(Get-ChildItem -LiteralPath $RemoteRootUNC -Recurse -Filter 'config.xml' -ErrorAction SilentlyContinue |
+                            Where-Object { $_.FullName -match '(?i)\\(ProPlus|Standard)\.WW\\config\.xml$' })
+            $args = ''
+            if ($candidates.Count -ge 1) {
+                $first = $candidates[0]; $rel = $first.FullName.Substring($RemoteRootUNC.Length).TrimStart('\')
+                $local = Join-Path $RemoteRootLocal $rel
+                Write-Host "Usando config.xml: $local" -ForegroundColor DarkGray
+                $args = "/config `"$local`""
+            } else {
+                Write-Host "config.xml não encontrado nas pastas *.WW. Tentando /quiet /norestart." -ForegroundColor Yellow
+                $args = "/quiet /norestart"
+            }
+            return $args
+        }
+}
+function Acao-Instalar-Office365 {
+    param([Parameter(Mandatory)] [string] $Hostname,[Parameter(Mandatory)] [pscredential] $Credential)
+    Invoke-RemoteInstallFromShare -Hostname $Hostname -Credential $Credential -ProgramName $Msft.Office365.NomePrograma `
+        -SourcePath $Msft.Office365.Origem -RemoteSubfolder $Msft.Office365.Subpasta -ExecutableName $Msft.Office365.ExeNome `
+        -BuildArgsScript {
+            param($RemoteRootLocal, $RemoteRootUNC)
+            $xmls = @(Get-ChildItem -LiteralPath $RemoteRootUNC -Filter *.xml -ErrorAction SilentlyContinue | Sort-Object Name)
+            if ($xmls.Count -eq 0) { throw "Nenhum arquivo XML de configuração foi encontrado no instalador do Office 365. Coloque o configuration.xml na pasta." }
+            $sel = $xmls[0]; $rel = $sel.FullName.Substring($RemoteRootUNC.Length).TrimStart('\')
+            $local = Join-Path $RemoteRootLocal $rel
+            Write-Host "Usando configuration XML: $local" -ForegroundColor DarkGray
+            return "/configure `"$local`""
+        }
+}
+function Acao-Instalar-PowerBI {
+    param([Parameter(Mandatory)] [string] $Hostname,[Parameter(Mandatory)] [pscredential] $Credential)
+    Invoke-RemoteInstallFromShare -Hostname $Hostname -Credential $Credential -ProgramName $Msft.PowerBI.NomePrograma `
+        -SourcePath $Msft.PowerBI.Origem -RemoteSubfolder $Msft.PowerBI.Subpasta -ExecutableName $Msft.PowerBI.ExeNome `
+        -BuildArgsScript { param($RemoteRootLocal, $RemoteRootUNC) "/quiet /norestart ACCEPT_EULA=1" }
+}
+function Acao-Instalar-Project2010 {
+    param([Parameter(Mandatory)] [string] $Hostname,[Parameter(Mandatory)] [pscredential] $Credential)
+    Invoke-RemoteInstallFromShare -Hostname $Hostname -Credential $Credential -ProgramName $Msft.Project2010.NomePrograma `
+        -SourcePath $Msft.Project2010.Origem -RemoteSubfolder $Msft.Project2010.Subpasta -ExecutableName $Msft.Project2010.ExeNome `
+        -BuildArgsScript {
+            param($RemoteRootLocal, $RemoteRootUNC)
+            $candidates = @(Get-ChildItem -LiteralPath $RemoteRootUNC -Recurse -Filter 'config.xml' -ErrorAction SilentlyContinue |
+                            Where-Object { $_.FullName -match '(?i)\\Project\.WW\\config\.xml$' })
+            $args = ''
+            if ($candidates.Count -ge 1) {
+                $first = $candidates[0]; $rel = $first.FullName.Substring($RemoteRootUNC.Length).TrimStart('\')
+                $local = Join-Path $RemoteRootLocal $rel
+                Write-Host "Usando config.xml: $local" -ForegroundColor DarkGray
+                $args = "/config `"$local`""
+            } else {
+                Write-Host "Project.WW\config.xml não encontrado. Tentando /quiet /norestart." -ForegroundColor Yellow
+                $args = "/quiet /norestart"
+            }
+            return $args
+        }
+}
+
+function Acao-Desinstalar-RadConsole {
+    param(
+        [Parameter(Mandatory)] [string] $Hostname,
+        [Parameter(Mandatory)] [pscredential] $Credential
+    )
+    try {
+        Write-Host ""
+        Write-Host "Desinstalação - $($RadConsole.NomePrograma)" -ForegroundColor Cyan
+        Write-Host "Procurando por: '$($RadConsole.DisplayName)'" -ForegroundColor DarkGray
+        $entries = Find-RemoteUninstallEntries -Hostname $Hostname -Credential $Credential -DisplayName $RadConsole.DisplayName
+        if (-not $entries -or $entries.Count -eq 0) {
+            Write-Host "Não foi possível localizar '$($RadConsole.DisplayName)' no host $Hostname." -ForegroundColor Yellow
+            Write-Host "Verifique o nome no Painel de Controle (Programas e Recursos) e tente novamente." -ForegroundColor Yellow
+            return
+        }
+        $tgtLower = $RadConsole.DisplayName.Trim().ToLower()
+        $ranked = $entries | Sort-Object -Property @{
+            Expression = { $n = $_.DisplayName.ToLower(); if ($n -eq $tgtLower) { 0 } elseif ($n.StartsWith($tgtLower)) { 1 } else { 2 } }
+        }, @{ Expression = { if ($_.Guid) { 0 } else { 1 } } }
+        $info = $ranked | Select-Object -First 1
+        Write-Host "Encontrado: $($info.DisplayName)" -ForegroundColor Green
+        if ($info.Guid) { Write-Host "Product GUID: $($info.Guid)" -ForegroundColor DarkGray }
+        if ($info.UninstallString) { Write-Host "UninstallString: $($info.UninstallString)" -ForegroundColor DarkGray }
+        if ($info.QuietUninstallString) { Write-Host "QuietUninstallString: $($info.QuietUninstallString)" -ForegroundColor DarkGray }
+        if (-not (Read-YesNo "Deseja DESINSTALAR silenciosamente agora?")) {
+            Write-Host "Desinstalação cancelada. Voltando ao menu..." -ForegroundColor Yellow
+            return
+        }
+        $cmd = $null
+        if ($info.Guid) {
+            $cmd = "msiexec.exe /x `"$($info.Guid)`" /qn /norestart"
+        } elseif ($info.QuietUninstallString) {
+            $cmd = $info.QuietUninstallString
+        } elseif ($info.UninstallString) {
+            if ($info.UninstallString -match '(?i)msiexec') {
+                $cmd = "$($info.UninstallString) /qn /norestart"
+            } else {
+                $cmd = $info.UninstallString
+                Write-Host "Aviso: desinstalador não é MSI; pode não ser silencioso." -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "Não foi possível construir o comando de desinstalação." -ForegroundColor Red
+            return
+        }
+        Write-Host "Iniciando desinstalação em $Hostname..." -ForegroundColor Cyan
+        $start = Start-RemoteProcess -Hostname $Hostname -Credential $Credential -CommandLine $cmd
+        if ($start.ReturnValue -ne 0) {
+            Write-Host "Falha ao iniciar a desinstalação (WMI retornou $($start.ReturnValue))." -ForegroundColor Red
+            return
+        }
+        if ($start.ProcessId -and $start.ProcessId -gt 0) {
+            $finished = Wait-RemoteProcessByProcessId -Hostname $Hostname -Credential $Credential -ProcessId $start.ProcessId -TimeoutSeconds 900
+            if ($finished) {
+                Write-Host "Processo de desinstalação finalizado (PID $($start.ProcessId))." -ForegroundColor Green
+            } else {
+                Write-Host "Tempo esgotado aguardando a desinstalação (PID $($start.ProcessId))." -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "Desinstalação disparada, mas o PID não foi retornado." -ForegroundColor Yellow
+        }
+        Start-Sleep -Seconds 3
+        $left = Find-RemoteUninstallEntries -Hostname $Hostname -Credential $Credential -DisplayName $RadConsole.DisplayName
+        if (-not $left -or $left.Count -eq 0) {
+            Write-Host "✅ '$($RadConsole.DisplayName)' não foi mais encontrado no registro. Desinstalação concluída." -ForegroundColor Green
+        } else {
+            Write-Host "⚠️ Ainda há entradas do produto no registro. Pode requerer reinicialização, permissão ou outro desinstalador." -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Log-Exception -Ex $_
+        Write-Host "Erro durante a desinstalação." -ForegroundColor Red
+    }
+}
+
+# ===== ORDEM EXATA: 1) hostname -> 2) credenciais -> 3) menus =====
+try {
+    $TargetHostname = Read-Host "Digite o HOSTNAME do computador de destino"
+    if ([string]::IsNullOrWhiteSpace($TargetHostname)) {
+        Write-Host "Hostname inválido. Encerrando." -ForegroundColor Red
+        return
+    }
+    Write-Host "📍 Host de destino: $TargetHostname" -ForegroundColor DarkGray
+    $TargetCredential = Get-Credential -Message "Insira credenciais administrativas para \\$TargetHostname\d$ (ex.: DOMINIO\Administrador)"
+
+    while ($true) {
+        Clear-Host
+        Write-Host "=== Gerenciador Remoto ===" -ForegroundColor Cyan
+        Write-Host "Destino: \\$TargetHostname\d$"
+        Write-Host "--------------------------"
+        Write-Host "1 - Instalação de Programas"
+        Write-Host "2 - Desinstalação de Programas"
+        Write-Host "0 - Sair"
+        Write-Host "--------------------------"
+
+        $main = Read-Host "Selecione a opção"
+        switch ($main) {
+            '1' {
+                # SUBMENU INSTALAÇÃO
+                while ($true) {
+                    Clear-Host
+                    Write-Host "=== Instalação de Programas ===" -ForegroundColor Cyan
+                    Write-Host "1 - $($RadConsole.NomePrograma)"
+                    Write-Host "2 - Microsoft"
+                    Write-Host "3 - Sair"
+                    Write-Host "-------------------------------"
+                    $opt = Read-Host "Escolha"
+                    switch ($opt) {
+                        '1' { Acao-Instalar-RadConsole -Hostname $TargetHostname -Credential $TargetCredential; Pause }
+                        '2' {
+                            # SUBMENU MICROSOFT
+                            while ($true) {
+                                Clear-Host
+                                Write-Host "=== Microsoft ===" -ForegroundColor Cyan
+                                Write-Host "1 - $($Msft.Office2016.NomePrograma)"
+                                Write-Host "2 - $($Msft.Office365.NomePrograma)"
+                                Write-Host "3 - $($Msft.PowerBI.NomePrograma)"
+                                Write-Host "4 - $($Msft.Project2010.NomePrograma)"
+                                Write-Host "5 - Voltar"
+                                Write-Host "----------------"
+                                $optMs = Read-Host "Escolha"
+                                switch ($optMs) {
+                                    '1' { Acao-Instalar-Office2016  -Hostname $TargetHostname -Credential $TargetCredential; Pause }
+                                    '2' { Acao-Instalar-Office365   -Hostname $TargetHostname -Credential $TargetCredential; Pause }
+                                    '3' { Acao-Instalar-PowerBI     -Hostname $TargetHostname -Credential $TargetCredential; Pause }
+                                    '4' { Acao-Instalar-Project2010 -Hostname $TargetHostname -Credential $TargetCredential; Pause }
+                                    '5' { break }
+                                    default { Write-Host "Opção inválida." -ForegroundColor Yellow; Start-Sleep -Seconds 1 }
+                                }
+                                if ($optMs -eq '5') { break }
+                            }
+                        }
+                        '3' { break }  # volta ao menu principal
+                        default { Write-Host "Opção inválida." -ForegroundColor Yellow; Start-Sleep -Seconds 1 }
+                    }
+                    if ($opt -eq '3') { break }
+                }
+            }
+            '2' {
+                # SUBMENU DESINSTALAÇÃO (mantido como antes)
+                while ($true) {
+                    Clear-Host
+                    Write-Host "=== Desinstalação de Programas ===" -ForegroundColor Cyan
+                    Write-Host "1 - $($RadConsole.NomePrograma)"
+                    Write-Host "2 - Sair"
+                    Write-Host "----------------------------------"
+                    $opt = Read-Host "Escolha"
+                    switch ($opt) {
+                        '1' { Acao-Desinstalar-RadConsole -Hostname $TargetHostname -Credential $TargetCredential; Pause }
+                        '2' { break }
+                        default { Write-Host "Opção inválida." -ForegroundColor Yellow; Start-Sleep -Seconds 1 }
+                    }
+                    if ($opt -eq '2') { break }
+                }
+            }
+            '0' {
+                Write-Host "Saindo..." -ForegroundColor Cyan
+                break
+            }
+            default {
+                Write-Host "Opção inválida." -ForegroundColor Yellow
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+}
+catch {
+    Log-Exception -Ex $_
+    Write-Host "❗ Ocorreu um erro não tratado no nível superior." -ForegroundColor Red
+    Read-Host "Pressione Enter para sair..."
+}
+finally {
+    try { Stop-Transcript | Out-Null } catch {}
+    Write-Host "📝 LOG salvo em: $Global:LogPath" -ForegroundColor Cyan
+}
